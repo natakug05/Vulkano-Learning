@@ -1,18 +1,47 @@
 use std::{error::Error, sync::Arc};
 
+use image::{ImageBuffer, Rgba};
 use vulkano::{
-    Validated, VulkanLibrary, buffer::{
+    Validated, VulkanLibrary,
+    buffer::{
         AllocateBufferError, Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer,
-    }, command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage, CopyBufferInfo, allocator::{
-        StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo,
-    }}, descriptor_set::{PersistentDescriptorSet, WriteDescriptorSet, allocator::StandardDescriptorSetAllocator}, device::{Device, DeviceCreateInfo, Queue, QueueCreateInfo, QueueFlags, physical::PhysicalDevice}, instance::{Instance, InstanceCreateFlags, InstanceCreateInfo}, memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator}, pipeline::{ComputePipeline, Pipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo, compute::ComputePipelineCreateInfo, layout::PipelineDescriptorSetLayoutCreateInfo}, sync::{self, GpuFuture},
+    },
+    command_buffer::{
+        AutoCommandBufferBuilder, ClearColorImageInfo, CommandBufferUsage, CopyBufferInfo,
+        CopyImageToBufferInfo,
+        allocator::{StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo},
+    },
+    descriptor_set::{
+        PersistentDescriptorSet, WriteDescriptorSet, allocator::StandardDescriptorSetAllocator,
+    },
+    device::{
+        Device, DeviceCreateInfo, Queue, QueueCreateInfo, QueueFlags, physical::PhysicalDevice,
+    },
+    format::{ClearColorValue, Format},
+    image::{Image, ImageCreateInfo, ImageType, ImageUsage},
+    instance::{Instance, InstanceCreateFlags, InstanceCreateInfo},
+    memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator},
+    pipeline::{
+        ComputePipeline, Pipeline, PipelineBindPoint, PipelineLayout,
+        PipelineShaderStageCreateInfo, compute::ComputePipelineCreateInfo,
+        layout::PipelineDescriptorSetLayoutCreateInfo,
+    },
+    sync::{self, GpuFuture},
 };
 
 mod cs {
-    vulkano_shaders::shader!{
+    vulkano_shaders::shader! {
         ty: "compute",
         path: "src/shaders/multiply.comp",
     }
+}
+
+struct GpuContext {
+    device: Arc<Device>,
+    queue: Arc<Queue>,
+    memory_allocator: Arc<StandardMemoryAllocator>,
+    command_buffer_allocator: StandardCommandBufferAllocator,
+    descriptor_set_allocator: StandardDescriptorSetAllocator,
 }
 
 // Dummy struct
@@ -77,15 +106,14 @@ fn initialize_device() -> Result<Arc<PhysicalDevice>, Box<dyn Error>> {
         .ok_or("no devices".into())
 }
 
-fn simple_allocation(
-    memory_allocator: &Arc<StandardMemoryAllocator>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let _simple_buffer = allocate_simple_data_buffer(&memory_allocator, 12)?;
-    let _struct_buffer = allocate_struct_data_buffer(&memory_allocator, MyStruct { a: 5, b: 69 })?;
+fn simple_allocation(ctx: &GpuContext) -> Result<(), Box<dyn std::error::Error>> {
+    let _simple_buffer = allocate_simple_data_buffer(&ctx.memory_allocator, 12)?;
+    let _struct_buffer =
+        allocate_struct_data_buffer(&ctx.memory_allocator, MyStruct { a: 5, b: 69 })?;
 
     let iter = (0..128).map(|_| 5u8);
     let buffer = Buffer::from_iter(
-        memory_allocator.clone(),
+        ctx.memory_allocator.clone(),
         BufferCreateInfo {
             usage: BufferUsage::UNIFORM_BUFFER,
             ..Default::default()
@@ -106,15 +134,10 @@ fn simple_allocation(
     Ok(())
 }
 
-fn command_buffer_copy_with_future(
-    device: &Arc<Device>,
-    memory_allocator: &Arc<StandardMemoryAllocator>,
-    queue_family_index: u32,
-    queue: &Arc<Queue>,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn command_buffer_copy_with_future(ctx: &GpuContext) -> Result<(), Box<dyn std::error::Error>> {
     let source_content = 0..64;
     let source = Buffer::from_iter(
-        memory_allocator.clone(),
+        ctx.memory_allocator.clone(),
         BufferCreateInfo {
             usage: BufferUsage::TRANSFER_SRC,
             ..Default::default()
@@ -129,7 +152,7 @@ fn command_buffer_copy_with_future(
 
     let destination_content = (0..64).map(|_| 0);
     let destination = Buffer::from_iter(
-        memory_allocator.clone(),
+        ctx.memory_allocator.clone(),
         BufferCreateInfo {
             usage: BufferUsage::TRANSFER_DST,
             ..Default::default()
@@ -142,14 +165,9 @@ fn command_buffer_copy_with_future(
         destination_content,
     )?;
 
-    let command_buffer_allocator = StandardCommandBufferAllocator::new(
-        device.clone(),
-        StandardCommandBufferAllocatorCreateInfo::default(),
-    );
-
     let mut builder = AutoCommandBufferBuilder::primary(
-        &command_buffer_allocator,
-        queue_family_index,
+        &ctx.command_buffer_allocator,
+        ctx.queue.queue_family_index(),
         CommandBufferUsage::OneTimeSubmit,
     )
     .unwrap();
@@ -160,8 +178,8 @@ fn command_buffer_copy_with_future(
 
     let command_buffer = builder.build().unwrap();
 
-    let future = sync::now(device.clone())
-        .then_execute(queue.clone(), command_buffer)
+    let future = sync::now(ctx.device.clone())
+        .then_execute(ctx.queue.clone(), command_buffer)
         .unwrap()
         .then_signal_fence_and_flush()
         .unwrap();
@@ -177,14 +195,10 @@ fn command_buffer_copy_with_future(
     Ok(())
 }
 
-fn perform_gpu_compute(
-    device: &Arc<Device>,
-    memory_allocator: &Arc<StandardMemoryAllocator>,
-    queue: &Arc<Queue>,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn perform_gpu_compute(ctx: &GpuContext) -> Result<(), Box<dyn std::error::Error>> {
     let data_iter = 0..65536u32;
     let data_buffer = Buffer::from_iter(
-        memory_allocator.clone(),
+        ctx.memory_allocator.clone(),
         BufferCreateInfo {
             usage: BufferUsage::STORAGE_BUFFER,
             ..Default::default()
@@ -197,25 +211,23 @@ fn perform_gpu_compute(
         data_iter,
     )?;
 
-    let shader = cs::load(device.clone())?;
+    let shader = cs::load(ctx.device.clone())?;
     let cs = shader.entry_point("main").unwrap();
     let stage = PipelineShaderStageCreateInfo::new(cs);
     let layout = PipelineLayout::new(
-        device.clone(),
+        ctx.device.clone(),
         PipelineDescriptorSetLayoutCreateInfo::from_stages([&stage])
-            .into_pipeline_layout_create_info(device.clone())
+            .into_pipeline_layout_create_info(ctx.device.clone())
             .unwrap(),
     )
     .unwrap();
 
     let compute_pipeline = ComputePipeline::new(
-        device.clone(),
+        ctx.device.clone(),
         None,
         ComputePipelineCreateInfo::stage_layout(stage, layout),
     )?;
 
-    let descriptor_set_allocator =
-        StandardDescriptorSetAllocator::new(device.clone(), Default::default());
     let pipeline_layout = compute_pipeline.layout();
     let descriptor_set_layouts = pipeline_layout.set_layouts();
 
@@ -224,21 +236,16 @@ fn perform_gpu_compute(
         .get(descriptor_set_layout_index)
         .unwrap();
     let descriptor_set = PersistentDescriptorSet::new(
-        &descriptor_set_allocator,
+        &ctx.descriptor_set_allocator,
         descriptor_set_layout.clone(),
         [WriteDescriptorSet::buffer(0, data_buffer.clone())], // 0 is the binding
         [],
     )
     .unwrap();
 
-    let command_buffer_allocator = StandardCommandBufferAllocator::new(
-        device.clone(),
-        StandardCommandBufferAllocatorCreateInfo::default(),
-    );
-
     let mut command_buffer_builder = AutoCommandBufferBuilder::primary(
-        &command_buffer_allocator,
-        queue.queue_family_index(),
+        &ctx.command_buffer_allocator,
+        ctx.queue.queue_family_index(),
         CommandBufferUsage::OneTimeSubmit,
     )
     .unwrap();
@@ -260,8 +267,8 @@ fn perform_gpu_compute(
 
     let command_buffer = command_buffer_builder.build().unwrap();
 
-    let future = sync::now(device.clone())
-        .then_execute(queue.clone(), command_buffer)
+    let future = sync::now(ctx.device.clone())
+        .then_execute(ctx.queue.clone(), command_buffer)
         .unwrap()
         .then_signal_fence_and_flush()
         .unwrap();
@@ -274,7 +281,72 @@ fn perform_gpu_compute(
     }
 
     println!("Everything succeeded!");
-    
+
+    Ok(())
+}
+
+fn create_image(ctx: &GpuContext) -> Result<(), Box<dyn std::error::Error>> {
+    let image = Image::new(
+        ctx.memory_allocator.clone(),
+        ImageCreateInfo {
+            image_type: ImageType::Dim2d,
+            format: Format::R8G8B8A8_UNORM,
+            extent: [1024, 1024, 1],
+            usage: ImageUsage::TRANSFER_DST | ImageUsage::TRANSFER_SRC,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+            ..Default::default()
+        },
+    )?;
+
+    let buf = Buffer::from_iter(
+        ctx.memory_allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::TRANSFER_DST,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                | MemoryTypeFilter::HOST_RANDOM_ACCESS,
+            ..Default::default()
+        },
+        (0..1024 * 1024 * 4).map(|_| 0u8),
+    )
+    .expect("failed to create buffer");
+
+    let mut builder = AutoCommandBufferBuilder::primary(
+        &ctx.command_buffer_allocator,
+        ctx.queue.queue_family_index(),
+        CommandBufferUsage::OneTimeSubmit,
+    )?;
+
+    builder
+        .clear_color_image(ClearColorImageInfo {
+            clear_value: ClearColorValue::Float([0.0, 0.0, 1.0, 1.0]),
+            ..ClearColorImageInfo::image(image.clone())
+        })?
+        .copy_image_to_buffer(CopyImageToBufferInfo::image_buffer(
+            image.clone(),
+            buf.clone(),
+        ))?;
+
+    let command_buffer = builder.build()?;
+
+    let future = sync::now(ctx.device.clone())
+        .then_execute(ctx.queue.clone(), command_buffer)?
+        .then_signal_fence_and_flush()?;
+
+    future.wait(None)?;
+
+    let buffer_content = buf.read()?;
+    let image = ImageBuffer::<Rgba<u8>, _>::from_raw(1024, 1024, &buffer_content[..])
+        .ok_or("Couldn't convert image content to PNG")?;
+    image.save("artifacts/image.png")?;
+
+    println!("Everything succeeded!");
+
     Ok(())
 }
 
@@ -290,7 +362,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .ok_or("no device queue found")? as u32;
 
-    let (gfx_device, mut queues) = Device::new(
+    let (device, mut queues) = Device::new(
         physical_device,
         DeviceCreateInfo {
             queue_create_infos: vec![QueueCreateInfo {
@@ -302,12 +374,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     let queue = queues.next().ok_or("no queue")?;
+    let memory_allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
+    let command_buffer_allocator = StandardCommandBufferAllocator::new(
+        device.clone(),
+        StandardCommandBufferAllocatorCreateInfo::default(),
+    );
+    let descriptor_set_allocator =
+        StandardDescriptorSetAllocator::new(device.clone(), Default::default());
 
-    let memory_allocator = Arc::new(StandardMemoryAllocator::new_default(gfx_device.clone()));
+    let ctx = GpuContext {
+        device,
+        queue,
+        memory_allocator,
+        command_buffer_allocator,
+        descriptor_set_allocator,
+    };
 
-    simple_allocation(&memory_allocator)?;
-    command_buffer_copy_with_future(&gfx_device, &memory_allocator, queue_family_index, &queue)?;
-    perform_gpu_compute(&gfx_device, &memory_allocator, &queue)?;
+    simple_allocation(&ctx)?;
+    command_buffer_copy_with_future(&ctx)?;
+    perform_gpu_compute(&ctx)?;
+    create_image(&ctx)?;
 
     Ok(())
 }
