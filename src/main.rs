@@ -8,7 +8,8 @@ use vulkano::{
     },
     command_buffer::{
         AutoCommandBufferBuilder, ClearColorImageInfo, CommandBufferUsage, CopyBufferInfo,
-        CopyImageToBufferInfo,
+        CopyImageToBufferInfo, RenderPassBeginInfo, SubpassBeginInfo, SubpassContents,
+        SubpassEndInfo,
         allocator::{StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo},
     },
     descriptor_set::{
@@ -22,10 +23,21 @@ use vulkano::{
     instance::{Instance, InstanceCreateFlags, InstanceCreateInfo},
     memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator},
     pipeline::{
-        ComputePipeline, Pipeline, PipelineBindPoint, PipelineLayout,
-        PipelineShaderStageCreateInfo, compute::ComputePipelineCreateInfo,
+        ComputePipeline, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
+        PipelineShaderStageCreateInfo,
+        compute::ComputePipelineCreateInfo,
+        graphics::{
+            GraphicsPipelineCreateInfo,
+            color_blend::{ColorBlendAttachmentState, ColorBlendState},
+            input_assembly::InputAssemblyState,
+            multisample::MultisampleState,
+            rasterization::RasterizationState,
+            vertex_input::{Vertex, VertexDefinition},
+            viewport::{Viewport, ViewportState},
+        },
         layout::PipelineDescriptorSetLayoutCreateInfo,
     },
+    render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass},
     shader::ShaderModule,
     sync::{self, GpuFuture},
 };
@@ -44,12 +56,28 @@ mod mandelbrot_cs {
     }
 }
 
+mod triangle {
+    vulkano_shaders::shader! {
+        shaders: {
+            vs: { ty: "vertex", path: "src/shaders/triangle.vert" },
+            fs: { ty: "fragment", path: "src/shaders/triangle.frag" },
+        }
+    }
+}
+
 struct GpuContext {
     device: Arc<Device>,
     queue: Arc<Queue>,
     memory_allocator: Arc<StandardMemoryAllocator>,
     command_buffer_allocator: StandardCommandBufferAllocator,
     descriptor_set_allocator: StandardDescriptorSetAllocator,
+}
+
+#[derive(BufferContents, Vertex)]
+#[repr(C)]
+struct MyVertex {
+    #[format(R32G32_SFLOAT)]
+    position: [f32; 2],
 }
 
 // Dummy struct
@@ -199,7 +227,7 @@ fn command_buffer_copy_with_future(ctx: &GpuContext) -> Result<(), Box<dyn std::
     let destination_content = destination.read().unwrap();
     assert_eq!(&*src_content, &*destination_content);
 
-    println!("Everything succeeded!");
+    println!("Created command buffer successfully!");
 
     Ok(())
 }
@@ -296,27 +324,35 @@ fn perform_gpu_compute(ctx: &GpuContext) -> Result<(), Box<dyn std::error::Error
         assert_eq!(*val, n as u32 * 12);
     }
 
-    println!("Everything succeeded!");
+    println!("Performed GPU multiplication compute shader successfully!");
 
     Ok(())
 }
 
-// Chapter 5 generate a blue PNG from the GPU
-fn create_image(ctx: &GpuContext) -> Result<(), Box<dyn std::error::Error>> {
-    let image = Image::new(
+// Helper function for the many calls we saw to image creation
+fn create_image(
+    ctx: &GpuContext,
+    usage: ImageUsage,
+) -> Result<Arc<Image>, Box<dyn std::error::Error>> {
+    Ok(Image::new(
         ctx.memory_allocator.clone(),
         ImageCreateInfo {
             image_type: ImageType::Dim2d,
             format: Format::R8G8B8A8_UNORM,
             extent: [1024, 1024, 1],
-            usage: ImageUsage::TRANSFER_DST | ImageUsage::TRANSFER_SRC,
+            usage,
             ..Default::default()
         },
         AllocationCreateInfo {
             memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
             ..Default::default()
         },
-    )?;
+    )?)
+}
+
+// Chapter 5 generate a blue PNG from the GPU
+fn draw_basic_image(ctx: &GpuContext) -> Result<(), Box<dyn std::error::Error>> {
+    let image = create_image(&ctx, ImageUsage::TRANSFER_DST | ImageUsage::TRANSFER_SRC)?;
 
     let buf = Buffer::from_iter(
         ctx.memory_allocator.clone(),
@@ -362,27 +398,14 @@ fn create_image(ctx: &GpuContext) -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("Couldn't convert image content to PNG")?;
     image.save("artifacts/image.png")?;
 
-    println!("Everything succeeded!");
+    println!("Drew basic blue image successfully!");
 
     Ok(())
 }
 
 // Chapter 5 cont. with fractal shader
 fn draw_fractal(ctx: &GpuContext) -> Result<(), Box<dyn std::error::Error>> {
-    let image = Image::new(
-        ctx.memory_allocator.clone(),
-        ImageCreateInfo {
-            image_type: ImageType::Dim2d,
-            format: Format::R8G8B8A8_UNORM,
-            extent: [1024, 1024, 1],
-            usage: ImageUsage::STORAGE | ImageUsage::TRANSFER_SRC,
-            ..Default::default()
-        },
-        AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
-            ..Default::default()
-        },
-    )?;
+    let image = create_image(&ctx, ImageUsage::STORAGE | ImageUsage::TRANSFER_SRC)?;
 
     let view = ImageView::new_default(image.clone())?;
     let compute_pipeline =
@@ -446,6 +469,182 @@ fn draw_fractal(ctx: &GpuContext) -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("could not convert image to png")?;
     image.save("artifacts/fractal.png")?;
 
+    println!("Drew mandelbrot set fractal image successfully!");
+
+    Ok(())
+}
+
+fn create_graphics_pipeline(
+    ctx: &GpuContext,
+    render_pass: &Arc<RenderPass>,
+    viewport: Viewport,
+) -> Result<Arc<GraphicsPipeline>, Box<dyn std::error::Error>> {
+    // A Vulkan shader can in theory contain multiple entry points, so we have to specify
+    // which one.
+    let vs = triangle::load_vs(ctx.device.clone())?
+        .entry_point("main")
+        .ok_or("vertex shader has no `main` entry point")?;
+    let fs = triangle::load_fs(ctx.device.clone())?
+        .entry_point("main")
+        .ok_or("fragment shader has no `main` entry point")?;
+
+    let vertex_input_state = MyVertex::per_vertex().definition(&vs.info().input_interface)?;
+
+    let stages = [
+        PipelineShaderStageCreateInfo::new(vs),
+        PipelineShaderStageCreateInfo::new(fs),
+    ];
+
+    let layout = PipelineLayout::new(
+        ctx.device.clone(),
+        PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
+            .into_pipeline_layout_create_info(ctx.device.clone())?,
+    )?;
+
+    let subpass =
+        Subpass::from(render_pass.clone(), 0).ok_or("Could not create subpass on render pass")?;
+
+    Ok(GraphicsPipeline::new(
+        ctx.device.clone(),
+        None,
+        GraphicsPipelineCreateInfo {
+            stages: stages.into_iter().collect(),
+            vertex_input_state: Some(vertex_input_state),
+            input_assembly_state: Some(InputAssemblyState::default()),
+            viewport_state: Some(ViewportState {
+                viewports: [viewport].into_iter().collect(),
+                ..Default::default()
+            }),
+            rasterization_state: Some(RasterizationState::default()),
+            multisample_state: Some(MultisampleState::default()),
+            color_blend_state: Some(ColorBlendState::with_attachment_states(
+                subpass.num_color_attachments(),
+                ColorBlendAttachmentState::default(),
+            )),
+            subpass: Some(subpass.into()),
+            ..GraphicsPipelineCreateInfo::layout(layout)
+        },
+    )?)
+}
+
+// Chapter 6 drawing a triangle using the pipeline
+fn draw_triangle(ctx: &GpuContext) -> Result<(), Box<dyn std::error::Error>> {
+    let vertex1 = MyVertex {
+        position: [-0.5, -0.5],
+    };
+    let vertex2 = MyVertex {
+        position: [0.0, 0.5],
+    };
+    let vertex3 = MyVertex {
+        position: [0.5, -0.25],
+    };
+
+    let vertex_buffer = Buffer::from_iter(
+        ctx.memory_allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::VERTEX_BUFFER,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            ..Default::default()
+        },
+        vec![vertex1, vertex2, vertex3],
+    )?;
+
+    let render_pass = vulkano::single_pass_renderpass!(
+        ctx.device.clone(),
+        attachments: {
+            color: {
+                format: Format::R8G8B8A8_UNORM,
+                samples: 1,
+                load_op: Clear,
+                store_op: Store,
+            },
+        },
+        pass: {
+            color: [color],
+            depth_stencil: {},
+        },
+    )?;
+
+    let image = create_image(
+        &ctx,
+        ImageUsage::COLOR_ATTACHMENT | ImageUsage::TRANSFER_SRC,
+    )?;
+    let view = ImageView::new_default(image.clone())?;
+    let framebuffer = Framebuffer::new(
+        render_pass.clone(),
+        FramebufferCreateInfo {
+            attachments: vec![view],
+            ..Default::default()
+        },
+    )?;
+
+    let viewport = Viewport {
+        offset: [0.0, 0.0],
+        extent: [1024.0, 1024.0],
+        depth_range: 0.0..=1.0,
+    };
+
+    let buf = Buffer::from_iter(
+        ctx.memory_allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::TRANSFER_DST,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                | MemoryTypeFilter::HOST_RANDOM_ACCESS,
+            ..Default::default()
+        },
+        (0..1024 * 1024 * 4).map(|_| 0u8),
+    )
+    .expect("failed to create buffer");
+
+    let pipeline = create_graphics_pipeline(&ctx, &render_pass, viewport)?;
+
+    let mut builder = AutoCommandBufferBuilder::primary(
+        &ctx.command_buffer_allocator,
+        ctx.queue.queue_family_index(),
+        CommandBufferUsage::OneTimeSubmit,
+    )?;
+
+    builder
+        .begin_render_pass(
+            RenderPassBeginInfo {
+                clear_values: vec![Some([0.0, 0.0, 1.0, 1.0].into())],
+                ..RenderPassBeginInfo::framebuffer(framebuffer.clone())
+            },
+            SubpassBeginInfo {
+                contents: SubpassContents::Inline,
+                ..Default::default()
+            },
+        )?
+        .bind_pipeline_graphics(pipeline.clone())?
+        .bind_vertex_buffers(0, vertex_buffer.clone())?
+        .draw(3, 1, 0, 0)?
+        .end_render_pass(SubpassEndInfo::default())?
+        .copy_image_to_buffer(CopyImageToBufferInfo::image_buffer(
+            image.clone(),
+            buf.clone(),
+        ))?;
+
+    let command_buffer = builder.build()?;
+    let future = sync::now(ctx.device.clone())
+        .then_execute(ctx.queue.clone(), command_buffer)?
+        .then_signal_fence_and_flush()?;
+
+    future.wait(None)?;
+
+    let buffer_content = buf.read()?;
+    let image = ImageBuffer::<Rgba<u8>, _>::from_raw(1024, 1024, &buffer_content[..])
+        .ok_or("Couldn't convert image to png")?;
+    image.save("artifacts/triangle.png")?;
+
+    println!("Drew triangle successfully!");
+
     Ok(())
 }
 
@@ -492,8 +691,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     simple_allocation(&ctx)?;
     command_buffer_copy_with_future(&ctx)?;
     perform_gpu_compute(&ctx)?;
-    create_image(&ctx)?;
+    draw_basic_image(&ctx)?;
     draw_fractal(&ctx)?;
+    draw_triangle(&ctx)?;
 
     Ok(())
 }
