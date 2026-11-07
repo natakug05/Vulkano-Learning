@@ -2,27 +2,19 @@ use std::{error::Error, sync::Arc};
 
 use image::{ImageBuffer, Rgba};
 use vulkano::{
-    Validated, VulkanLibrary,
-    buffer::{
+    Validated, VulkanLibrary, buffer::{
         AllocateBufferError, Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer,
-    },
-    command_buffer::{
+    }, command_buffer::{
         AutoCommandBufferBuilder, ClearColorImageInfo, CommandBufferUsage, CopyBufferInfo,
         CopyImageToBufferInfo, RenderPassBeginInfo, SubpassBeginInfo, SubpassContents,
         SubpassEndInfo,
         allocator::{StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo},
-    },
-    descriptor_set::{
+    }, descriptor_set::{
         PersistentDescriptorSet, WriteDescriptorSet, allocator::StandardDescriptorSetAllocator,
-    },
-    device::{
-        Device, DeviceCreateInfo, Queue, QueueCreateInfo, QueueFlags, physical::PhysicalDevice,
-    },
-    format::{ClearColorValue, Format},
-    image::{Image, ImageCreateInfo, ImageType, ImageUsage, view::ImageView},
-    instance::{Instance, InstanceCreateFlags, InstanceCreateInfo},
-    memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator},
-    pipeline::{
+    }, device::{
+        Device, DeviceCreateInfo, DeviceExtensions, Queue, QueueCreateInfo, QueueFlags,
+        physical::{PhysicalDevice, PhysicalDeviceType},
+    }, format::{ClearColorValue, Format}, image::{Image, ImageCreateInfo, ImageType, ImageUsage, view::ImageView}, instance::{Instance, InstanceCreateFlags, InstanceCreateInfo}, memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator}, pipeline::{
         ComputePipeline, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
         PipelineShaderStageCreateInfo,
         compute::ComputePipelineCreateInfo,
@@ -36,10 +28,12 @@ use vulkano::{
             viewport::{Viewport, ViewportState},
         },
         layout::PipelineDescriptorSetLayoutCreateInfo,
-    },
-    render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass},
-    shader::ShaderModule,
-    sync::{self, GpuFuture},
+    }, render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass}, shader::ShaderModule, swapchain::{Surface, Swapchain, SwapchainCreateInfo}, sync::{self, GpuFuture},
+};
+use winit::{
+    event::{Event, WindowEvent},
+    event_loop::{ControlFlow, EventLoop},
+    window::WindowBuilder,
 };
 
 mod cs {
@@ -126,20 +120,49 @@ fn allocate_simple_data_buffer(
     )
 }
 
-fn initialize_device() -> Result<Arc<PhysicalDevice>, Box<dyn Error>> {
+fn select_physical_device(
+    vulkan_instance: &Arc<Instance>,
+    surface: &Arc<Surface>,
+    device_extensions: &DeviceExtensions,
+) -> (Arc<PhysicalDevice>, u32) {
+    vulkan_instance
+        .enumerate_physical_devices()
+        .expect("could not enumerate devices")
+        .filter(|p| p.supported_extensions().contains(&device_extensions))
+        .filter_map(|p| {
+            p.queue_family_properties()
+                .iter()
+                .enumerate()
+                .position(|(i, q)| {
+                    q.queue_flags.contains(QueueFlags::GRAPHICS)
+                        && p.surface_support(i as u32, &surface).unwrap_or(false)
+                })
+                .map(|q| (p, q as u32))
+        })
+        .min_by_key(|(p, _)| match p.properties().device_type {
+            PhysicalDeviceType::DiscreteGpu => 0,
+            PhysicalDeviceType::IntegratedGpu => 1,
+            PhysicalDeviceType::VirtualGpu => 2,
+            PhysicalDeviceType::Cpu => 3,
+            _ => 4,
+        })
+        .expect("no device available")
+}
+
+fn initialize_vulkan(event_loop: &EventLoop<()>) -> Result<Arc<Instance>, Box<dyn Error>> {
     let library = VulkanLibrary::new().expect("no local Vulkan library/DLL");
-    let vulkano_instance = Instance::new(
+    let required_extensions = Surface::required_extensions(&event_loop);
+    let vulkan_instance = Instance::new(
         library,
         InstanceCreateInfo {
             flags: InstanceCreateFlags::ENUMERATE_PORTABILITY,
+            enabled_extensions: required_extensions,
             ..Default::default()
         },
     )
     .unwrap_or_else(|err| panic!("failed to create instance: {:?}", err));
-    vulkano_instance
-        .enumerate_physical_devices()?
-        .next()
-        .ok_or("no devices".into())
+
+    Ok(vulkan_instance)
 }
 
 fn simple_allocation(ctx: &GpuContext) -> Result<(), Box<dyn std::error::Error>> {
@@ -649,24 +672,53 @@ fn draw_triangle(ctx: &GpuContext) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let physical_device = initialize_device()?;
-    let queue_family_index = physical_device
-        .queue_family_properties()
-        .iter()
-        .position(|queue_family_properties| {
-            queue_family_properties
-                .queue_flags
-                .contains(QueueFlags::GRAPHICS)
-        })
-        .ok_or("no device queue found")? as u32;
+    let event_loop = EventLoop::new();
+    let vulkan_instance = initialize_vulkan(&event_loop)?;
+    let window = Arc::new(WindowBuilder::new().build(&event_loop)?);
+    let surface = Surface::from_window(vulkan_instance.clone(), window.clone())?;
+    let device_extensions = DeviceExtensions {
+        khr_swapchain: true,
+        ..DeviceExtensions::empty()
+    };
+    let (physical_device, queue_family_index) =
+        select_physical_device(&vulkan_instance, &surface, &device_extensions);
+
+    let caps = physical_device
+        .surface_capabilities(&surface, Default::default())
+        .expect("failed to get surface capabilities");
+
+    let dimensions = window.inner_size();
+    let composite_alpha = caps
+        .supported_composite_alpha
+        .into_iter()
+        .next()
+        .ok_or("could not get composite_alpha for window")?;
+    // Eww why doesn't the tutorial explain the zeroth member of zeroth position in this vector...
+    // Assumption is we just want anything and the first Format will do.
+    let image_format = physical_device
+        .surface_formats(&surface, Default::default())?[0].0;
 
     let (device, mut queues) = Device::new(
-        physical_device,
+        physical_device.clone(),
         DeviceCreateInfo {
             queue_create_infos: vec![QueueCreateInfo {
                 queue_family_index,
                 ..Default::default()
             }],
+            enabled_extensions: device_extensions,
+            ..Default::default()
+        },
+    )?;
+
+    let (swapchain, images) = Swapchain::new(
+        device.clone(),
+        surface.clone(),
+        SwapchainCreateInfo {
+            min_image_count: caps.min_image_count + 1,
+            image_format,
+            image_extent: dimensions.into(),
+            image_usage: ImageUsage::COLOR_ATTACHMENT,
+            composite_alpha,
             ..Default::default()
         },
     )?;
@@ -695,5 +747,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     draw_fractal(&ctx)?;
     draw_triangle(&ctx)?;
 
-    Ok(())
+    event_loop.run(|event, _, control_flow| match event {
+        Event::WindowEvent {
+            event: WindowEvent::CloseRequested,
+            ..
+        } => {
+            *control_flow = ControlFlow::Exit;
+        }
+        _ => {}
+    });
 }
