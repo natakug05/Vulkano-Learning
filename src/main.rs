@@ -18,7 +18,7 @@ use vulkano::{
         Device, DeviceCreateInfo, Queue, QueueCreateInfo, QueueFlags, physical::PhysicalDevice,
     },
     format::{ClearColorValue, Format},
-    image::{Image, ImageCreateInfo, ImageType, ImageUsage},
+    image::{Image, ImageCreateInfo, ImageType, ImageUsage, view::ImageView},
     instance::{Instance, InstanceCreateFlags, InstanceCreateInfo},
     memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator},
     pipeline::{
@@ -26,6 +26,7 @@ use vulkano::{
         PipelineShaderStageCreateInfo, compute::ComputePipelineCreateInfo,
         layout::PipelineDescriptorSetLayoutCreateInfo,
     },
+    shader::ShaderModule,
     sync::{self, GpuFuture},
 };
 
@@ -33,6 +34,13 @@ mod cs {
     vulkano_shaders::shader! {
         ty: "compute",
         path: "src/shaders/multiply.comp",
+    }
+}
+
+mod mandelbrot_cs {
+    vulkano_shaders::shader! {
+        ty: "compute",
+        path: "src/shaders/mandelbrot.comp",
     }
 }
 
@@ -134,6 +142,7 @@ fn simple_allocation(ctx: &GpuContext) -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
+// Chapter 3 command buffer intro
 fn command_buffer_copy_with_future(ctx: &GpuContext) -> Result<(), Box<dyn std::error::Error>> {
     let source_content = 0..64;
     let source = Buffer::from_iter(
@@ -195,6 +204,28 @@ fn command_buffer_copy_with_future(ctx: &GpuContext) -> Result<(), Box<dyn std::
     Ok(())
 }
 
+// Chapter 4/5 combined shader pipeline helper
+fn create_compute_pipeline(
+    device: &Arc<Device>,
+    shader: Arc<ShaderModule>,
+) -> Result<Arc<ComputePipeline>, Box<dyn std::error::Error>> {
+    let entry = shader
+        .entry_point("main")
+        .ok_or("shader has no `main` entry point")?;
+    let stage = PipelineShaderStageCreateInfo::new(entry);
+    let layout = PipelineLayout::new(
+        device.clone(),
+        PipelineDescriptorSetLayoutCreateInfo::from_stages([&stage])
+            .into_pipeline_layout_create_info(device.clone())?,
+    )?;
+    Ok(ComputePipeline::new(
+        device.clone(),
+        None,
+        ComputePipelineCreateInfo::stage_layout(stage, layout),
+    )?)
+}
+
+// Chapter 4 multiply shader
 fn perform_gpu_compute(ctx: &GpuContext) -> Result<(), Box<dyn std::error::Error>> {
     let data_iter = 0..65536u32;
     let data_buffer = Buffer::from_iter(
@@ -211,22 +242,7 @@ fn perform_gpu_compute(ctx: &GpuContext) -> Result<(), Box<dyn std::error::Error
         data_iter,
     )?;
 
-    let shader = cs::load(ctx.device.clone())?;
-    let cs = shader.entry_point("main").unwrap();
-    let stage = PipelineShaderStageCreateInfo::new(cs);
-    let layout = PipelineLayout::new(
-        ctx.device.clone(),
-        PipelineDescriptorSetLayoutCreateInfo::from_stages([&stage])
-            .into_pipeline_layout_create_info(ctx.device.clone())
-            .unwrap(),
-    )
-    .unwrap();
-
-    let compute_pipeline = ComputePipeline::new(
-        ctx.device.clone(),
-        None,
-        ComputePipelineCreateInfo::stage_layout(stage, layout),
-    )?;
+    let compute_pipeline = create_compute_pipeline(&ctx.device, cs::load(ctx.device.clone())?)?;
 
     let pipeline_layout = compute_pipeline.layout();
     let descriptor_set_layouts = pipeline_layout.set_layouts();
@@ -285,6 +301,7 @@ fn perform_gpu_compute(ctx: &GpuContext) -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
+// Chapter 5 generate a blue PNG from the GPU
 fn create_image(ctx: &GpuContext) -> Result<(), Box<dyn std::error::Error>> {
     let image = Image::new(
         ctx.memory_allocator.clone(),
@@ -350,6 +367,88 @@ fn create_image(ctx: &GpuContext) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+// Chapter 5 cont. with fractal shader
+fn draw_fractal(ctx: &GpuContext) -> Result<(), Box<dyn std::error::Error>> {
+    let image = Image::new(
+        ctx.memory_allocator.clone(),
+        ImageCreateInfo {
+            image_type: ImageType::Dim2d,
+            format: Format::R8G8B8A8_UNORM,
+            extent: [1024, 1024, 1],
+            usage: ImageUsage::STORAGE | ImageUsage::TRANSFER_SRC,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+            ..Default::default()
+        },
+    )?;
+
+    let view = ImageView::new_default(image.clone())?;
+    let compute_pipeline =
+        create_compute_pipeline(&ctx.device, mandelbrot_cs::load(ctx.device.clone())?)?;
+    let layout = compute_pipeline
+        .layout()
+        .set_layouts()
+        .get(0)
+        .ok_or("couldn't load compute layout")?;
+    let set = PersistentDescriptorSet::new(
+        &ctx.descriptor_set_allocator,
+        layout.clone(),
+        [WriteDescriptorSet::image_view(0, view.clone())], // 0 is the binding
+        [],
+    )?;
+
+    let buf = Buffer::from_iter(
+        ctx.memory_allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::TRANSFER_DST,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                | MemoryTypeFilter::HOST_RANDOM_ACCESS,
+            ..Default::default()
+        },
+        (0..1024 * 1024 * 4).map(|_| 0u8),
+    )
+    .expect("failed to create buffer");
+
+    let mut builder = AutoCommandBufferBuilder::primary(
+        &ctx.command_buffer_allocator,
+        ctx.queue.queue_family_index(),
+        CommandBufferUsage::OneTimeSubmit,
+    )?;
+    builder
+        .bind_pipeline_compute(compute_pipeline.clone())?
+        .bind_descriptor_sets(
+            PipelineBindPoint::Compute,
+            compute_pipeline.layout().clone(),
+            0,
+            set,
+        )?
+        .dispatch([1024 / 8, 1024 / 8, 1])?
+        .copy_image_to_buffer(CopyImageToBufferInfo::image_buffer(
+            image.clone(),
+            buf.clone(),
+        ))?;
+
+    let command_buffer = builder.build()?;
+
+    let future = sync::now(ctx.device.clone())
+        .then_execute(ctx.queue.clone(), command_buffer)?
+        .then_signal_fence_and_flush()?;
+
+    future.wait(None)?;
+
+    let buffer_content = buf.read()?;
+    let image = ImageBuffer::<Rgba<u8>, _>::from_raw(1024, 1024, &buffer_content[..])
+        .ok_or("could not convert image to png")?;
+    image.save("artifacts/fractal.png")?;
+
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let physical_device = initialize_device()?;
     let queue_family_index = physical_device
@@ -394,6 +493,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     command_buffer_copy_with_future(&ctx)?;
     perform_gpu_compute(&ctx)?;
     create_image(&ctx)?;
+    draw_fractal(&ctx)?;
 
     Ok(())
 }
